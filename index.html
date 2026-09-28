@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wave Forge · 一维薛定谔方程锻造炉</title>
+<style>
+  :root { --bg:#f7f8fa; --panel:#ffffff; --ink:#1c2330; --sub:#5b6472; --line:#dfe3ea;
+          --accent:#2563eb; --good:#15803d; --bad:#b91c1c; --warn:#b45309; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--ink); padding:24px; }
+  .wrap { max-width:1080px; margin:0 auto; }
+  h1 { font-size:22px; margin-bottom:4px; }
+  .sub { color:var(--sub); font-size:13px; margin-bottom:16px; line-height:1.6; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  canvas { width:100%; display:block; background:#fbfcfe; border:1px solid var(--line); border-radius:8px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+  .row label { font-size:13px; color:var(--sub); }
+  select, button, input[type=range] { font-size:13px; }
+  select { padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  button { padding:5px 14px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:hover { filter:brightness(0.97); }
+  input[type=range] { width:140px; }
+  .stats { display:flex; gap:18px; flex-wrap:wrap; margin-top:10px; font-size:13px; }
+  .stats b { font-weight:600; }
+  .stats span { color:var(--sub); margin-right:4px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:10px; }
+  th, td { border:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; }
+  th { background:#f1f4f9; }
+  .pass { color:var(--good); font-weight:600; }
+  .fail { color:var(--bad); font-weight:600; }
+  .mono { font-family:Consolas,Monaco,monospace; font-size:12px; }
+  footer { color:var(--sub); font-size:12px; text-align:center; padding:10px 0 4px; }
+  #selfcheckStatus { font-size:13px; margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Wave Forge · 一维薛定谔方程锻造炉</h1>
+  <div class="sub">
+    单文件、零外部依赖的含时薛定谔方程实验台：纯 JS 手写 Crank–Nicolson 隐式求解（复三角 Thomas 解算），
+    ħ = m = 1 自然单位。内置一键不变量自检面板，并配 Node 无头测试（engine.test.mjs，从本页正则抽取
+    <span class="mono">&lt;script id="engine"&gt;</span> 进 vm 沙箱执行）。作者：晨星 / Chenxing · MIT
+  </div>
+
+  <div class="panel">
+    <canvas id="cv" width="1040" height="340"></canvas>
+    <div class="row">
+      <label>势场 V(x)</label>
+      <select id="potSel">
+        <option value="well">无限深势阱（盒内 V=0）</option>
+        <option value="barrier">方势垒（中央高墙）</option>
+        <option value="harmonic">谐振子（½ω²x²）</option>
+        <option value="free">自由（V=0，宽盒）</option>
+      </select>
+      <label>dt</label><input type="range" id="dtRange" min="1" max="40" value="10">
+      <span class="mono" id="dtLabel"></span>
+      <label>帧步数</label><input type="range" id="sppRange" min="1" max="20" value="4">
+      <button class="primary" id="btnPlay">播放</button>
+      <button id="btnReset">重置</button>
+      <label>初态</label>
+      <select id="initSel">
+        <option value="packet">高斯波包（右行）</option>
+        <option value="eigen">第 1 本征态</option>
+        <option value="mix">本征态叠加</option>
+      </select>
+      <span class="mono" id="seedLabel"></span>
+    </div>
+    <div class="stats">
+      <div><span>t</span><b id="stT">0.000</b></div>
+      <div><span>norm Σ|ψ|²dx</span><b id="stNorm">1.000000000</b></div>
+      <div><span>⟨E⟩</span><b id="stE">-</b></div>
+      <div><span>⟨x⟩</span><b id="stX">-</b></div>
+      <div><span>σ(t)</span><b id="stS">-</b></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="margin-top:0">
+      <button class="primary" id="btnCheck">一键自检（10 条不变量）</button>
+      <span id="selfcheckStatus">点击后在本页内跑与 Node 版完全相同的用例。</span>
+    </div>
+    <div id="checkOut"></div>
+  </div>
+
+  <footer>Wave Forge v1.0.0 · © 2026 晨星 / Chenxing · MIT License · 零网络请求，可离线使用</footer>
+</div>
+
+<script id="engine">
+/* =============================================================================
+ * wave-forge 引擎 —— 一维含时薛定谔方程 Crank–Nicolson 求解器
+ * 纯 JavaScript，零外部依赖，不含任何 document/window/fetch 引用，
+ * 可整体抽出运行于 Node / Worker / 任意 JS 运行时。
+ *
+ * 约定：ħ = m = 1；域 [0, L]，N 个网格点含两端点，Dirichlet 边界 ψ(0)=ψ(L)=0；
+ * ψ 以 {re, im} 两个 Float64Array 表示；中心差分 Laplacian，精度 O(dx²)。
+ *
+ * Crank–Nicolson：(I + i·dt/2·H) ψⁿ⁺¹ = (I − i·dt/2·H) ψⁿ，酉格式 ⇒ 范数严格守恒。
+ * Author: 晨星 / Chenxing
+ * ========================================================================== */
+'use strict';
+
+function makeRng(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t = (t + 0x6d2b79f5) >>> 0;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* 网格与势场 ---------------------------------------------------------------- */
+function makeGrid(N, L, Vfn) {
+  const dx = L / (N - 1);
+  const x = new Float64Array(N);
+  const V = new Float64Array(N);
+  for (let j = 0; j < N; j++) {
+    x[j] = j * dx;
+    V[j] = Vfn ? Vfn(x[j], L) : 0;
+  }
+  return { N: N, L: L, dx: dx, x: x, V: V };
+}
+
+/* 初态 ---------------------------------------------------------------------- */
+/* 高斯波包：|ψ|² ∝ exp(−(x−x0)²/(2σ0²))（σ0 为振幅宽），相位 e^{i k0 x}，归一化 */
+function gaussianPacket(g, x0, sigma0, k0) {
+  const re = new Float64Array(g.N), im = new Float64Array(g.N);
+  let s = 0;
+  for (let j = 0; j < g.N; j++) {
+    const dxs = g.x[j] - x0;
+    const env = Math.exp(-dxs * dxs / (4 * sigma0 * sigma0));
+    re[j] = env * Math.cos(k0 * g.x[j]);
+    im[j] = env * Math.sin(k0 * g.x[j]);
+    s += env * env;
+  }
+  const nrm = Math.sqrt(s * g.dx);
+  for (let j = 0; j < g.N; j++) { re[j] /= nrm; im[j] /= nrm; }
+  return { re: re, im: im };
+}
+
+/* 无限深势阱第 n 本征态（解析投影到网格） */
+function eigenstate(g, n) {
+  const re = new Float64Array(g.N), im = new Float64Array(g.N);
+  const s = Math.sqrt(2 / g.L);
+  for (let j = 0; j < g.N; j++) re[j] = s * Math.sin(n * Math.PI * g.x[j] / g.L);
+  return { re: re, im: im };
+}
+
+/* 随机本征态叠加（可播种，用于确定性测试） */
+function randomSuperposition(g, nMax, seed) {
+  const rng = makeRng(seed);
+  const out = { re: new Float64Array(g.N), im: new Float64Array(g.N) };
+  let s = 0;
+  for (let j = 0; j < g.N; j++) { out.re[j] = 0; out.im[j] = 0; }
+  for (let n = 1; n <= nMax; n++) {
+    const a = rng() * 2 - 1, b = rng() * 2 - 1;
+    const st = eigenstate(g, n);
+    for (let j = 0; j < g.N; j++) {
+      out.re[j] += a * st.re[j];
+      out.im[j] += b * st.re[j];
+    }
+  }
+  for (let j = 0; j < g.N; j++) s += out.re[j] * out.re[j] + out.im[j] * out.im[j];
+  const nrm = Math.sqrt(s * g.dx);
+  for (let j = 0; j < g.N; j++) { out.re[j] /= nrm; out.im[j] /= nrm; }
+  return out;
+}
+
+/* 观测量 ---------------------------------------------------------------------- */
+function norm(g, psi) {
+  let s = 0;
+  for (let j = 0; j < g.N; j++) s += psi.re[j] * psi.re[j] + psi.im[j] * psi.im[j];
+  return s * g.dx;
+}
+function xMean(g, psi) {
+  let s = 0;
+  for (let j = 0; j < g.N; j++) {
+    const p = psi.re[j] * psi.re[j] + psi.im[j] * psi.im[j];
+    s += g.x[j] * p;
+  }
+  return s * g.dx; /* 调用方确保 norm=1 */
+}
+function x2Mean(g, psi) {
+  let s = 0;
+  for (let j = 0; j < g.N; j++) {
+    const p = psi.re[j] * psi.re[j] + psi.im[j] * psi.im[j];
+    s += g.x[j] * g.x[j] * p;
+  }
+  return s * g.dx;
+}
+/* Hψ 显式作用（内部点中心差分；边界 ψ=0） */
+function applyH(g, psi) {
+  const out = { re: new Float64Array(g.N), im: new Float64Array(g.N) };
+  const c = 1 / (2 * g.dx * g.dx);
+  for (let j = 1; j < g.N - 1; j++) {
+    const lapR = (psi.re[j + 1] - 2 * psi.re[j] + psi.re[j - 1]);
+    const lapI = (psi.im[j + 1] - 2 * psi.im[j] + psi.im[j - 1]);
+    out.re[j] = -c * lapR + g.V[j] * psi.re[j];
+    out.im[j] = -c * lapI + g.V[j] * psi.im[j];
+  }
+  return out;
+}
+/* ⟨E⟩ 两种口径：kinetic+potential 微分式（默认）；conj 式用于交叉验证 */
+function energy(g, psi) {
+  const c = 1 / (2 * g.dx * g.dx);
+  let kin = 0, pot = 0;
+  for (let j = 1; j < g.N - 1; j++) {
+    const dR = (psi.re[j + 1] - psi.re[j - 1]) / (2 * g.dx);
+    const dI = (psi.im[j + 1] - psi.im[j - 1]) / (2 * g.dx);
+    kin += dR * dR + dI * dI;
+    const p = psi.re[j] * psi.re[j] + psi.im[j] * psi.im[j];
+    pot += g.V[j] * p;
+  }
+  return 0.5 * kin * g.dx + pot * g.dx;
+}
+function energyConj(g, psi) {
+  const Hp = applyH(g, psi);
+  let s = 0;
+  for (let j = 0; j < g.N; j++) {
+    s += psi.re[j] * Hp.re[j] + psi.im[j] * Hp.im[j];
+  }
+  return s * g.dx;
+}
+function inner(g, a, b) { /* ⟨a|b⟩ 复内积，返回 {re,im} */
+  let sr = 0, si = 0;
+  for (let j = 0; j < g.N; j++) {
+    sr += a.re[j] * b.re[j] + a.im[j] * b.im[j];
+    si += a.re[j] * b.im[j] - a.im[j] * b.re[j];
+  }
+  return { re: sr * g.dx, im: si * g.dx };
+}
+
+/* Crank–Nicolson 一步（复三角 Thomas 解算，O(N)） ----------------------------- */
+/* A = I + i·dt/2·H；sub = sup = −i·dt/(4dx²)；diag_j = 1 + i·dt/2·(1/dx² + V_j)
+   rhs = (I − i·dt/2·H)ψ。内部点 j=1..N−2，边界恒 0。 */
+function cnStep(g, psi, dt, buf) {
+  const N = g.N;
+  const dx2 = g.dx * g.dx;
+  const hdt = dt / 2;
+  const subR = 0, subI = -hdt / (2 * dx2);           /* 次/超对角 = −i·dt/(4dx²) */
+  if (!buf) buf = {};
+  if (!buf.ar || buf.ar.length < N) {
+    buf.ar = new Float64Array(N); buf.ai = new Float64Array(N);
+    buf.br = new Float64Array(N); buf.bi = new Float64Array(N);
+    buf.cr = new Float64Array(N); buf.ci = new Float64Array(N);
+    buf.dr = new Float64Array(N); buf.di = new Float64Array(N);
+  }
+  const ar = buf.ar, ai = buf.ai, br = buf.br, bi = buf.bi;
+  const cr = buf.cr, ci = buf.ci, dr = buf.dr, di = buf.di;
+
+  for (let j = 1; j < N - 1; j++) {
+    /* A = I + i·hdt·H ⇒ diag 实部恒为 1，虚部 = hdt·(1/dx²+V_j)（2026-09-29 修复：
+       原实现把 hdt·H 误加进实部，导致每步整体衰减、范数崩塌） */
+    const HR = -((psi.re[j + 1] - 2 * psi.re[j] + psi.re[j - 1]) / (2 * dx2)) + g.V[j] * psi.re[j];
+    const HI = -((psi.im[j + 1] - 2 * psi.im[j] + psi.im[j - 1]) / (2 * dx2)) + g.V[j] * psi.im[j];
+    dr[j] = psi.re[j] + hdt * HI;
+    di[j] = psi.im[j] - hdt * HR;
+    ar[j] = 1; ai[j] = hdt * (1 / dx2 + g.V[j]);
+    cr[j] = subR; ci[j] = subI;
+  }
+  /* 复 Thomas 前向消元（内部 1..N−2） */
+  for (let j = 2; j < N - 1; j++) {
+    /* m = sub / ar[j-1]（sub 与上一步存下的对角复除） */
+    const pR = ar[j - 1], pI = ai[j - 1];
+    const den = pR * pR + pI * pI;
+    const mR = (subR * pR + subI * pI) / den;
+    const mI = (subI * pR - subR * pI) / den;
+    ar[j] -= mR * cr[j - 1] - mI * ci[j - 1];
+    ai[j] -= mR * ci[j - 1] + mI * cr[j - 1];
+    dr[j] -= mR * dr[j - 1] - mI * di[j - 1];
+    di[j] -= mR * di[j - 1] + mI * dr[j - 1];
+  }
+  /* 回代 */
+  const last = N - 2;
+  const dLast = ar[last] * ar[last] + ai[last] * ai[last];
+  psi.re[last] = (dr[last] * ar[last] + di[last] * ai[last]) / dLast;
+  psi.im[last] = (di[last] * ar[last] - dr[last] * ai[last]) / dLast;
+  for (let j = N - 3; j >= 1; j--) {
+    const xr = psi.re[j + 1], xi = psi.im[j + 1];
+    const rr = dr[j] - (cr[j] * xr - ci[j] * xi);
+    const ri = di[j] - (cr[j] * xi + ci[j] * xr);
+    const den = ar[j] * ar[j] + ai[j] * ai[j];
+    psi.re[j] = (rr * ar[j] + ri * ai[j]) / den;
+    psi.im[j] = (ri * ar[j] - rr * ai[j]) / den;
+  }
+  psi.re[0] = 0; psi.im[0] = 0; psi.re[N - 1] = 0; psi.im[N - 1] = 0;
+  return buf;
+}
+
+/* 静态本征对：逆迭代（实三对角 Thomas + Rayleigh 商） ------------------------- */
+function thomasReal(diag, off, b) { /* 解 (diag, off) 三对角 H x = b，H 对称 */
+  const N = diag.length;
+  const c = new Float64Array(N), d = new Float64Array(N);
+  c[0] = off / diag[0]; d[0] = b[0] / diag[0];
+  for (let j = 1; j < N; j++) {
+    const m = diag[j] - off * c[j - 1];
+    c[j] = off / m;
+    d[j] = (b[j] - off * d[j - 1]) / m;
+  }
+  const x = new Float64Array(N);
+  x[N - 1] = d[N - 1];
+  for (let j = N - 2; j >= 0; j--) x[j] = d[j] - c[j] * x[j + 1];
+  return x;
+}
+/* 求第 n 低本征对（n≥1）。仅在「内点」上建 M=N−2 阶三对角矩阵（Dirichlet 边界
+ * 严格解耦——若保留边界行而只改对角元，off 仍会把边界方程与内点耦合，矩阵就不是
+ * 离散哈密顿量了）。低阶态用上一步收敛的数值向量做投影正交化（deflation），
+ * 保证 ⟨ψₖ|ψⱼ⟩（j<k）降到舍入级而非 O(dx²)。 */
+function inverseIteration(g, n, iters) {
+  iters = iters || 80;
+  const N = g.N, M = N - 2;
+  const diag = new Float64Array(M), off = -1 / (2 * g.dx * g.dx);
+  for (let j = 1; j < N - 1; j++) diag[j - 1] = 1 / (g.dx * g.dx) + g.V[j];
+  const lowerNum = [];
+  let out = null;
+  for (let k = 1; k <= n; k++) {
+    const rng = makeRng(20260929 + k);
+    let b = new Float64Array(M);
+    for (let j = 0; j < M; j++) b[j] = rng() * 2 - 1;
+    for (let it = 0; it < iters; it++) {
+      for (let q = 0; q < lowerNum.length; q++) {
+        const lo = lowerNum[q];
+        let ip = 0;
+        for (let j = 0; j < M; j++) ip += lo[j + 1] * b[j] * g.dx; /* ⟨lo|b⟩，含 dx */
+        for (let j = 0; j < M; j++) b[j] -= ip * lo[j + 1];
+      }
+      const y = thomasReal(diag, off, b);
+      /* 投影必须放在求解之后：H⁻¹ 会把被投影掉的基态分量重新放大
+       * (E₂/E₁)^iters 倍，仅在迭代开头投影不足以压制 */
+      for (let q = 0; q < lowerNum.length; q++) {
+        const lo = lowerNum[q];
+        let ip = 0;
+        for (let j = 0; j < M; j++) ip += lo[j + 1] * y[j] * g.dx;
+        for (let j = 0; j < M; j++) y[j] -= ip * lo[j + 1];
+      }
+      let s = 0;
+      for (let j = 0; j < M; j++) s += y[j] * y[j];
+      const inv = 1 / Math.sqrt(s * g.dx);
+      for (let j = 0; j < M; j++) b[j] = y[j] * inv;
+    }
+    for (let q = 0; q < lowerNum.length; q++) {
+      const lo = lowerNum[q];
+      let ip = 0;
+      for (let j = 0; j < M; j++) ip += lo[j + 1] * b[j] * g.dx;
+      for (let j = 0; j < M; j++) b[j] -= ip * lo[j + 1];
+    }
+    let s2 = 0;
+    for (let j = 0; j < M; j++) s2 += b[j] * b[j];
+    const inv2 = 1 / Math.sqrt(s2 * g.dx);
+    const full = new Float64Array(N);
+    for (let j = 0; j < M; j++) full[j + 1] = b[j] * inv2;
+    if (k === n) {
+      out = { psi: { re: full, im: new Float64Array(N) }, E: 0 };
+      out.E = energyConj(g, out.psi);
+    } else {
+      lowerNum.push(full);
+    }
+  }
+  return out;
+}
+
+var ENGINE = {
+  makeRng: makeRng, makeGrid: makeGrid, gaussianPacket: gaussianPacket,
+  eigenstate: eigenstate, randomSuperposition: randomSuperposition,
+  norm: norm, xMean: xMean, x2Mean: x2Mean, applyH: applyH,
+  energy: energy, energyConj: energyConj, inner: inner,
+  cnStep: cnStep, inverseIteration: inverseIteration,
+};
+</script>
+
+<script>
+/* =============================================================================
+ * 界面层（可以碰 DOM 的部分）
+ * ========================================================================== */
+'use strict';
+var UI = (function () {
+  var cv = document.getElementById('cv');
+  var ctx = cv.getContext('2d');
+  var g = null, psi = null, buf = null, t = 0, playing = false, spp = 4, dt = 0.001;
+  var seed = 20260929;
+
+  function potFor(name) {
+    return function (x, L) {
+      if (name === 'well') return 0;
+      if (name === 'free') return 0;
+      if (name === 'barrier') { var c = L / 2; return Math.abs(x - c) < L * 0.04 ? 250 : 0; }
+      if (name === 'harmonic') { var w = 6; var xm = x - L / 2; return 0.5 * w * w * xm * xm; }
+      return 0;
+    };
+  }
+  function reset() {
+    var potName = document.getElementById('potSel').value;
+    var L = potName === 'free' ? 4 : 2;
+    g = ENGINE.makeGrid(600, L, potFor(potName));
+    dt = document.getElementById('dtRange').value * 0.0001;
+    spp = +document.getElementById('sppRange').value;
+    t = 0;
+    var init = document.getElementById('initSel').value;
+    if (init === 'packet') psi = ENGINE.gaussianPacket(g, L * 0.3, L * 0.05, 2 * Math.PI * 2);
+    else if (init === 'eigen') psi = ENGINE.eigenstate(g, 1);
+    else psi = ENGINE.randomSuperposition(g, 4, seed);
+    buf = null;
+    document.getElementById('seedLabel').textContent = 'seed=' + seed;
+    draw();
+    stats();
+  }
+  function step(n) {
+    for (var i = 0; i < n; i++) { ENGINE.cnStep(g, psi, dt, buf = buf || {}); t += dt; }
+  }
+  function stats() {
+    document.getElementById('stT').textContent = t.toFixed(3);
+    document.getElementById('stNorm').textContent = ENGINE.norm(g, psi).toFixed(9);
+    document.getElementById('stE').textContent = ENGINE.energy(g, psi).toFixed(4);
+    var xm = ENGINE.xMean(g, psi);
+    document.getElementById('stX').textContent = xm.toFixed(4);
+    var x2 = ENGINE.x2Mean(g, psi);
+    document.getElementById('stS').textContent = Math.sqrt(Math.max(0, x2 - xm * xm)).toFixed(4);
+  }
+  function draw() {
+    var W = cv.width, H = cv.height, pad = 10;
+    ctx.clearRect(0, 0, W, H);
+    var vmax = 0;
+    for (var j = 0; j < g.N; j++) vmax = Math.max(vmax, g.V[j]);
+    var scaleE = 0;
+    for (var k = 0; k < g.N; k++) {
+      var p = psi.re[k] * psi.re[k] + psi.im[k] * psi.im[k];
+      scaleE = Math.max(scaleE, p);
+    }
+    var X = function (j) { return pad + (g.x[j] / g.L) * (W - 2 * pad); };
+    var yBase = H - pad;
+    function Yv(v) { return yBase - (vmax > 0 ? (v / vmax) * (H * 0.35) : 0); }
+    function Yp(p) { return yBase - (p / (scaleE || 1)) * (H * 0.6); }
+    /* 势场 */
+    if (vmax > 0) {
+      ctx.fillStyle = 'rgba(37,99,235,0.08)';
+      ctx.beginPath();
+      ctx.moveTo(X(0), yBase);
+      for (var a = 0; a < g.N; a++) ctx.lineTo(X(a), Yv(g.V[a]));
+      ctx.lineTo(X(g.N - 1), yBase);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = 'rgba(37,99,235,0.5)'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (var b2 = 0; b2 < g.N; b2++) { var px = X(b2), py = Yv(g.V[b2]); b2 ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+      ctx.stroke();
+    }
+    /* |ψ|² */
+    ctx.fillStyle = 'rgba(21,128,61,0.25)';
+    ctx.beginPath(); ctx.moveTo(X(0), yBase);
+    for (var c2 = 0; c2 < g.N; c2++) ctx.lineTo(X(c2), Yp(psi.re[c2] * psi.re[c2] + psi.im[c2] * psi.im[c2]));
+    ctx.lineTo(X(g.N - 1), yBase); ctx.closePath(); ctx.fill();
+    /* Re / Im */
+    function curve(arr, color) {
+      ctx.strokeStyle = color; ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (var j = 0; j < g.N; j++) {
+        var amp = 1.6, y = yBase - arr[j] * amp * (H * 0.6) / Math.sqrt(scaleE || 1) * Math.sqrt(scaleE || 1);
+        y = yBase - arr[j] * (H * 0.6) * 0.5 / Math.max(0.2, Math.sqrt(scaleE));
+        j ? ctx.lineTo(X(j), y) : ctx.moveTo(X(j), y);
+      }
+      ctx.stroke();
+    }
+    curve(psi.re, '#b91c1c');
+    curve(psi.im, '#2563eb');
+    /* 图例 */
+    ctx.font = '12px sans-serif';
+    ctx.fillStyle = '#15803d'; ctx.fillText('|ψ|²', 16, 20);
+    ctx.fillStyle = '#b91c1c'; ctx.fillText('Re ψ', 60, 20);
+    ctx.fillStyle = '#2563eb'; ctx.fillText('Im ψ', 108, 20);
+  }
+  function loop() {
+    if (!playing) return;
+    step(spp);
+    draw(); stats();
+    requestAnimationFrame(loop);
+  }
+  document.getElementById('btnPlay').onclick = function () {
+    playing = !playing;
+    this.textContent = playing ? '暂停' : '播放';
+    if (playing) requestAnimationFrame(loop);
+  };
+  document.getElementById('btnReset').onclick = reset;
+  document.getElementById('potSel').onchange = reset;
+  document.getElementById('initSel').onchange = reset;
+  document.getElementById('dtRange').oninput = function () {
+    dt = this.value * 0.0001;
+    document.getElementById('dtLabel').textContent = (dt * 1000).toFixed(1) + 'e-4';
+  };
+  document.getElementById('sppRange').oninput = function () { spp = +this.value; };
+  document.getElementById('btnCheck').onclick = function () {
+    var out = document.getElementById('checkOut');
+    document.getElementById('selfcheckStatus').textContent = '自检运行中…';
+    setTimeout(function () {
+      var results = SELFTEST.runAll();
+      var allPass = true, html = '<table><tr><th>#</th><th>用例</th><th>说明 / 实测</th><th>关键数值</th><th>结果</th></tr>';
+      for (var i = 0; i < results.length; i++) {
+        var r = results[i];
+        if (!r.pass) allPass = false;
+        html += '<tr><td>' + (i + 1) + '</td><td>' + r.name + '</td><td>' + r.detail + '</td><td class="mono">' +
+          r.rows.map(function (row) { return row[0] + ': ' + row[1]; }).join('<br>') + '</td><td class="' +
+          (r.pass ? 'pass' : 'fail') + '">' + (r.pass ? '✅ PASS' : '❌ FAIL') + '</td></tr>';
+      }
+      html += '</table>';
+      out.innerHTML = html;
+      document.getElementById('selfcheckStatus').innerHTML = allPass
+        ? '<span class="pass">全部 ' + results.length + ' 条不变量通过 ✅</span>'
+        : '<span class="fail">存在失败用例 ❌</span>';
+    }, 30);
+  };
+  document.getElementById('dtLabel').textContent = '1.0e-4';
+  reset();
+  return { getG: function () { return g; }, getPsi: function () { return psi; } };
+})();
+</script>
+
+<script id="selftest">
+/* =============================================================================
+ * 自检用例 —— 与 engine.test.mjs 共享同一套断言逻辑（界面层可访问 ENGINE）
+ * ========================================================================== */
+'use strict';
+var SELFTEST = (function () {
+  function fmt(x, d) {
+    if (typeof x !== 'number' || !isFinite(x)) return String(x);
+    return x.toExponential(3);
+  }
+  function caseNorm() {
+    var g = ENGINE.makeGrid(601, 4, null);
+    var psi = ENGINE.gaussianPacket(g, 2, 0.3, Math.PI);
+    var buf = {};
+    var n0 = ENGINE.norm(g, psi);
+    for (var i = 0; i < 4000; i++) { ENGINE.cnStep(g, psi, 0.001, buf); }
+    var drift = Math.abs(ENGINE.norm(g, psi) - n0);
+    return { name: '范数守恒（Crank–Nicolson 酉性）', pass: drift < 1e-10,
+      detail: '高斯波包含壁反弹演化 4000 步（t=4），范数漂移 < 1e-10',
+      rows: [['范数漂移', fmt(drift)]] };
+  }
+  function caseOrtho() {
+    var g = ENGINE.makeGrid(401, 2, null);
+    var worst = 0, worstN = 0;
+    for (var n = 1; n <= 5; n++) {
+      var s = ENGINE.eigenstate(g, n);
+      var nn = ENGINE.norm(g, s);
+      worstN = Math.max(worstN, Math.abs(nn - 1));
+      for (var m = n + 1; m <= 5; m++) {
+        var ip = ENGINE.inner(g, s, ENGINE.eigenstate(g, m));
+        worst = Math.max(worst, Math.abs(ip.re), Math.abs(ip.im));
+      }
+    }
+    return { name: '本征态正交归一', pass: worst < 1e-10 && worstN < 1e-12,
+      detail: '前 5 个无限深势阱本征态：归一误差与两两正交误差',
+      rows: [['max|⟨n|m⟩| (n≠m)', fmt(worst)], ['max|‖ψₙ‖²−1|', fmt(worstN)]] };
+  }
+  function caseGround() {
+    var g = ENGINE.makeGrid(512, 1, null);
+    var r1 = ENGINE.inverseIteration(g, 1);
+    var r2 = ENGINE.inverseIteration(g, 2);
+    var E1a = Math.PI * Math.PI / 2, E2a = 2 * Math.PI * Math.PI;
+    var e1 = Math.abs(r1.E - E1a) / E1a, e2 = Math.abs(r2.E - E2a) / E2a;
+    var ip = ENGINE.inner(g, r1.psi, r2.psi);
+    return { name: '基态/第2本征能量 vs 解析解（逆迭代）', pass: e1 < 1e-4 && e2 < 1e-4 && Math.abs(ip.re) < 1e-5,
+      detail: 'N=512 网格数值本征值与 E₁=π²/2、E₂=2π² 对照（离散误差 O(dx²)≈3e-6）',
+      rows: [['E₁ 相对误差', fmt(e1)], ['E₂ 相对误差', fmt(e2)], ['|⟨ψ₁|ψ₂⟩|', fmt(Math.abs(ip.re))]] };
+  }
+  function caseDrift() {
+    var g = ENGINE.makeGrid(801, 4, null);
+    var x0 = 1.2, k0 = Math.PI, s0 = 0.25, T = 0.2, dt = 0.0002;
+    var psi = ENGINE.gaussianPacket(g, x0, s0, k0);
+    var buf = {};
+    for (var i = 0; i < Math.round(T / dt); i++) ENGINE.cnStep(g, psi, dt, buf);
+    var xm = ENGINE.xMean(g, psi);
+    var ana = x0 + k0 * T;
+    var err = Math.abs(xm - ana) / Math.abs(ana);
+    return { name: '自由波包中心 ⟨x⟩(t) = x₀ + ħk₀t/m', pass: err < 1e-3,
+      detail: 'L=4 宽盒、t=0.2 内边界远离波包，与解析漂移对照',
+      rows: [['数值 ⟨x⟩', xm.toFixed(6)], ['解析 x₀+ħk₀t', ana.toFixed(6)], ['相对误差', fmt(err)]] };
+  }
+  function caseSpread() {
+    var g = ENGINE.makeGrid(801, 4, null);
+    var x0 = 2, s0 = 0.3, T = 0.3, dt = 0.0002;
+    var psi = ENGINE.gaussianPacket(g, x0, s0, 0);
+    var buf = {};
+    for (var i = 0; i < Math.round(T / dt); i++) ENGINE.cnStep(g, psi, dt, buf);
+    var xm = ENGINE.xMean(g, psi), x2 = ENGINE.x2Mean(g, psi);
+    var sd = Math.sqrt(Math.max(0, x2 - xm * xm));
+    var ana = s0 * Math.sqrt(1 + (T / (2 * s0 * s0)) * (T / (2 * s0 * s0)));
+    var err = Math.abs(sd - ana) / ana;
+    return { name: '自由波包展宽 σ(t) = σ₀√(1+(ħt/2mσ₀²)²)', pass: err < 5e-3,
+      detail: 'σ₀=0.3、t=0.3 时展宽 94%，与解析方差对照',
+      rows: [['数值 σ(t)', sd.toFixed(6)], ['解析 σ(t)', ana.toFixed(6)], ['相对误差', fmt(err)]] };
+  }
+  function caseEnergy() {
+    var g = ENGINE.makeGrid(401, 2, null);
+    var psi = ENGINE.eigenstate(g, 1);
+    var E0 = ENGINE.energy(g, psi);
+    var buf = {}, worst = 0;
+    for (var i = 0; i < 2000; i++) {
+      ENGINE.cnStep(g, psi, 0.001, buf);
+      worst = Math.max(worst, Math.abs(ENGINE.energy(g, psi) - E0) / E0);
+    }
+    return { name: '本征态能量守恒（相位精确演化）', pass: worst < 1e-10,
+      detail: '第 1 本征态演化 2000 步，⟨E⟩ 相对漂移',
+      rows: [['max 相对漂移', fmt(worst)]] };
+  }
+  function caseUnitary() {
+    var g = ENGINE.makeGrid(401, 2, null);
+    var a = ENGINE.eigenstate(g, 1), b = ENGINE.eigenstate(g, 2);
+    var bufA = {}, bufB = {}, worst = 0;
+    for (var i = 0; i < 1500; i++) {
+      ENGINE.cnStep(g, a, 0.001, bufA);
+      ENGINE.cnStep(g, b, 0.001, bufB);
+      var ip = ENGINE.inner(g, a, b);
+      worst = Math.max(worst, Math.abs(ip.re), Math.abs(ip.im));
+    }
+    return { name: '酉性：正交对演化后仍正交', pass: worst < 1e-12,
+      detail: 'ψ₁、ψ₂ 同时演化 1500 步，|⟨ψ₁(t)|ψ₂(t)⟩| 保持',
+      rows: [['max |⟨ψ₁|ψ₂⟩|', fmt(worst)]] };
+  }
+  function caseConj() {
+    var g = ENGINE.makeGrid(401, 2, function (x, L) {
+      var c = L / 2; return Math.abs(x - c) < L * 0.05 ? 200 : 0;
+    });
+    var psi = ENGINE.gaussianPacket(g, 0.5, 0.12, Math.PI * 3);
+    var e1 = ENGINE.energy(g, psi), e2 = ENGINE.energyConj(g, psi);
+    var err = Math.abs(e1 - e2) / Math.abs(e2);
+    return { name: '⟨E⟩ 双口径交叉验证（微分式 ≡ 共轭式）', pass: err < 5e-3,
+      detail: '方势垒场内两条独立能量路径 O(dx²) 一致（守卫符号/因子/质量参数的量级错误）',
+      rows: [['相对误差', fmt(err)]] };
+  }
+  function caseFinite() {
+    var g = ENGINE.makeGrid(601, 4, function (x, L) {
+      var c = L / 2; return Math.abs(x - c) < L * 0.03 ? 300 : 0;
+    });
+    var psi = ENGINE.gaussianPacket(g, 1, 0.25, Math.PI * 4);
+    var buf = {}, bad = 0, scanned = 0;
+    for (var i = 0; i < 6000; i++) {
+      ENGINE.cnStep(g, psi, 0.001, buf);
+      if (i % 10 === 0) for (var j = 0; j < g.N; j++) {
+        scanned++;
+        if (!isFinite(psi.re[j]) || !isFinite(psi.im[j])) bad++;
+      }
+    }
+    return { name: '数值健康：长演化无 NaN / Infinity', pass: bad === 0,
+      detail: '方势垒场强散射 6000 步，每 10 步全网格扫描',
+      rows: [['扫描值数', scanned], ['非有限值', bad]] };
+  }
+  function caseDet() {
+    var g = ENGINE.makeGrid(401, 2, null);
+    var a = ENGINE.randomSuperposition(g, 4, 20260929);
+    var b = ENGINE.randomSuperposition(g, 4, 20260929);
+    var same = true;
+    for (var j = 0; j < g.N; j++) if (a.re[j] !== b.re[j] || a.im[j] !== b.im[j]) same = false;
+    var bufA = {}, bufB = {};
+    for (var i = 0; i < 500; i++) { ENGINE.cnStep(g, a, 0.001, bufA); ENGINE.cnStep(g, b, 0.001, bufB); }
+    var same2 = true;
+    for (var j2 = 0; j2 < g.N; j2++) if (a.re[j2] !== b.re[j2] || a.im[j2] !== b.im[j2]) same2 = false;
+    return { name: '确定性：同 seed 初态与演化逐位相同', pass: same && same2,
+      detail: 'seed=20260929 叠加初态 + 500 步演化全等',
+      rows: [['初态全等', same ? 'YES' : 'NO'], ['演化后全等', same2 ? 'YES' : 'NO']] };
+  }
+  function runAll() {
+    return [caseNorm(), caseOrtho(), caseGround(), caseDrift(), caseSpread(),
+            caseEnergy(), caseUnitary(), caseConj(), caseFinite(), caseDet()];
+  }
+  return { runAll: runAll };
+})();
+</script>
+</body>
+</html>
